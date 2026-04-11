@@ -1,0 +1,19 @@
+{
+  "name": "crowwws-monorepo",
+  "version": "1.0.0",
+  "description": "Crowwws monolithic platform deployment",
+  "private": true,
+  "scripts": {
+    "install:server": "cd server && npm install",
+    "install:client": "cd client && npm install",
+    "install:admin": "cd admin && npm install",
+    "postinstall": "npm run install:server && npm run install:client && npm run install:admin",
+    "build:client": "cd client && npm run build",
+    "build:admin": "cd admin && npm run build",
+    "build": "npm run build:client && npm run build:admin",
+    "start": "cd server && npm start",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "dev:admin": "cd admin && npm run dev"
+  }
+}

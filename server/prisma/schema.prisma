@@ -1,0 +1,59 @@
+// Prisma schema for the anonymous stranger chat platform
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  password   String
+  isVerified Boolean  @default(false)
+  isBanned   Boolean  @default(false)
+  banReason  String?
+  createdAt  DateTime @default(now())
+  reports    Report[]
+}
+
+model Report {
+  id         String   @id @default(uuid())
+  reporterId String
+  reportedId String
+  reason     String
+  sessionId  String
+  createdAt  DateTime @default(now())
+  reviewed   Boolean  @default(false)
+  reporter   User     @relation(fields: [reporterId], references: [id])
+}
+
+model BannedEmail {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  reason    String
+  createdAt DateTime @default(now())
+}
+
+model ModerationFlag {
+  id         String   @id @default(uuid())
+  sessionId  String
+  userId     String
+  type       String
+  confidence Float
+  reviewed   Boolean  @default(false)
+  action     String?
+  createdAt  DateTime @default(now())
+}
+
+model Session {
+  id        String    @id @default(uuid())
+  user1Id   String
+  user2Id   String
+  mode      String    @default("video")
+  startTime DateTime  @default(now())
+  endTime   DateTime?
+  flagged   Boolean   @default(false)
+}
