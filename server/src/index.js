@@ -27,6 +27,10 @@ const allowedOrigins = [
     'http://127.0.0.1:5173', 'http://127.0.0.1:5174', 'http://127.0.0.1:5175',
 ];
 
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
+if (process.env.ADMIN_URL) allowedOrigins.push(process.env.ADMIN_URL);
+if (process.env.CORS_ORIGINS) allowedOrigins.push(...process.env.CORS_ORIGINS.split(','));
+
 // Socket.io setup
 const io = new Server(server, {
     cors: {
