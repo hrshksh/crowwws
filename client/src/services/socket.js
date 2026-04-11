@@ -2,7 +2,8 @@
 import { io } from 'socket.io-client'
 
 let socket = null
-const SOCKET_ORIGIN = import.meta.env.VITE_API_ORIGIN || 'http://127.0.0.1:5000'
+const envOrigin = import.meta.env.VITE_API_ORIGIN;
+const SOCKET_ORIGIN = envOrigin ? envOrigin : (import.meta.env.PROD ? window.location.origin : 'http://127.0.0.1:5000');
 
 export function connectSocket() {
     const token = localStorage.getItem('token')

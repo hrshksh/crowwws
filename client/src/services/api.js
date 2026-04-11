@@ -1,8 +1,11 @@
 // API utility with axios and JWT interceptor
 import axios from 'axios'
 
+const apiOrigin = import.meta.env.VITE_API_ORIGIN;
+const apiBase = apiOrigin ? `${apiOrigin}/api` : (import.meta.env.PROD ? '/api' : 'http://127.0.0.1:5000/api');
+
 const api = axios.create({
-    baseURL: `${import.meta.env.VITE_API_ORIGIN || 'http://127.0.0.1:5000'}/api`,
+    baseURL: apiBase,
     headers: { 'Content-Type': 'application/json' },
 })
 
