@@ -6,9 +6,16 @@ let localStream = null;
 const configuration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' } // fallback free STUN
+        { urls: 'stun:global.stun.twilio.com:3478' }, // fallback free STUN
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
     ]
 };
+
+let iceCandidateQueue = [];
 
 /**
  * Initializes and returns the local video/audio stream.
@@ -53,6 +60,7 @@ export function createPeerConnection(onRemoteStream) {
     if (peerConnection) {
         peerConnection.close();
     }
+    iceCandidateQueue = [];
     peerConnection = new RTCPeerConnection(configuration);
 
     if (localStream) {
@@ -105,6 +113,12 @@ export async function handleReceiveOffer(sdp) {
     if (!peerConnection) return;
     try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+        
+        // Drain ICE queue safely now that remote desc is set
+        while (iceCandidateQueue.length > 0) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()));
+        }
+
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
         const socket = getSocket();
@@ -123,6 +137,11 @@ export async function handleReceiveAnswer(sdp) {
     if (!peerConnection) return;
     try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+        
+        // Drain ICE queue safely
+        while (iceCandidateQueue.length > 0) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()));
+        }
     } catch (err) {
         console.error('[WebRTC] Error handling answer:', err);
     }
@@ -133,6 +152,11 @@ export async function handleReceiveAnswer(sdp) {
  */
 export async function handleReceiveCandidate(candidate) {
     if (!peerConnection) return;
+    if (!peerConnection.remoteDescription) {
+        // Queue candidates if remote description isn't ready
+        iceCandidateQueue.push(candidate);
+        return;
+    }
     try {
         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {

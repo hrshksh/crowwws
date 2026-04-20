@@ -138,13 +138,14 @@ export default function ChatPage() {
                     })
 
                     const stream = await initializeLocalStream()
-                    if (localVideoRef.current) {
-                        localVideoRef.current.srcObject = stream
-                    }
-
-                    if (data.role === 'caller') {
-                        setTimeout(() => createOffer(), 500)
-                    }
+                    setTimeout(() => {
+                        if (localVideoRef.current) {
+                            localVideoRef.current.srcObject = stream
+                        }
+                        if (data.role === 'caller') {
+                            createOffer()
+                        }
+                    }, 200)
                 } catch (err) {
                     console.error('[Chat] WebRTC join error:', err)
                 }
