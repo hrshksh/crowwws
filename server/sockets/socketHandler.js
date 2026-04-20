@@ -2,8 +2,6 @@
 const jwt = require('jsonwebtoken');
 const { addToQueue, findKeywordMatch, findGeneralMatch, removeFromQueue } = require('../services/matchmaking');
 const { createSession, endSession, getSession, flagSession } = require('../services/sessionManager');
-const { generateToken, generateChannelName } = require('../services/agoraService');
-const { analyzeText, createFlag, incrementWarnings } = require('../services/moderation');
 const prisma = require('../src/prisma');
 
 // Track active connections: userId -> { socketId, sessionId, partnerId, partnerSocketId }
@@ -60,12 +58,8 @@ function registerSocketHandlers(io) {
                 if (match) {
                     // Found a match — pair them
                     const { matchedUser } = match;
-                    const channelName = generateChannelName();
                     const sessionData = await createSession(userId, matchedUser.userId, mode);
 
-                    // Generate Agora tokens for both users
-                    const token1 = generateToken(channelName, 1);
-                    const token2 = generateToken(channelName, 2);
 
                     // Update tracking for both users
                     activeUsers.set(userId, {
@@ -85,23 +79,17 @@ function registerSocketHandlers(io) {
                     await removeFromQueue(userId);
                     await removeFromQueue(matchedUser.userId);
 
-                    // Emit match_found to both
+                    // Emit match_found to both (designate local socket as caller)
                     socket.emit('match_found', {
                         sessionId: sessionData.sessionId,
-                        agoraToken: token1.token,
-                        channelName,
-                        appId: token1.appId,
-                        uid: 1,
                         mode,
+                        role: 'caller'
                     });
 
                     io.to(matchedUser.socketId).emit('match_found', {
                         sessionId: sessionData.sessionId,
-                        agoraToken: token2.token,
-                        channelName,
-                        appId: token2.appId,
-                        uid: 2,
                         mode,
+                        role: 'callee'
                     });
 
                     console.log(`[Socket] Matched: ${userId} <-> ${matchedUser.userId} (session: ${sessionData.sessionId})`);
@@ -139,36 +127,7 @@ function registerSocketHandlers(io) {
                 const userData = activeUsers.get(socket.userId);
                 if (!userData || userData.sessionId !== sessionId) return;
 
-                // Moderate text asynchronously
-                analyzeText(text).then(async (result) => {
-                    if (result.flagged) {
-                        await createFlag({
-                            sessionId,
-                            userId: socket.userId,
-                            type: 'text',
-                            confidence: result.score,
-                        });
-
-                        const warningCount = await incrementWarnings(socket.userId);
-                        socket.emit('moderation_warning', {
-                            message: 'Your message was flagged for inappropriate content.',
-                            warningCount,
-                        });
-
-                        if (warningCount >= 3) {
-                            // Auto-ban after 3 flags
-                            await prisma.user.update({
-                                where: { id: socket.userId },
-                                data: { isBanned: true, banReason: 'Automated ban: repeated toxic messages' },
-                            });
-                            socket.emit('banned', { reason: 'Your account has been banned for repeated policy violations.' });
-                            socket.disconnect(true);
-                            return;
-                        }
-                    }
-                }).catch((err) => console.error('[Socket] Text moderation error:', err));
-
-                // Forward message to partner immediately (don't block on moderation)
+                // Forward message directly to partner
                 if (userData.partnerSocketId) {
                     io.to(userData.partnerSocketId).emit('receive_message', {
                         text,
@@ -177,6 +136,28 @@ function registerSocketHandlers(io) {
                 }
             } catch (err) {
                 console.error('[Socket] send_message error:', err);
+            }
+        });
+
+        // ─── WEBRTC SIGNALING ───
+        socket.on('webrtc_offer', ({ sdp }) => {
+            const userData = activeUsers.get(socket.userId);
+            if (userData && userData.partnerSocketId) {
+                io.to(userData.partnerSocketId).emit('webrtc_offer', { sdp });
+            }
+        });
+
+        socket.on('webrtc_answer', ({ sdp }) => {
+            const userData = activeUsers.get(socket.userId);
+            if (userData && userData.partnerSocketId) {
+                io.to(userData.partnerSocketId).emit('webrtc_answer', { sdp });
+            }
+        });
+
+        socket.on('webrtc_ice_candidate', ({ candidate }) => {
+            const userData = activeUsers.get(socket.userId);
+            if (userData && userData.partnerSocketId) {
+                io.to(userData.partnerSocketId).emit('webrtc_ice_candidate', { candidate });
             }
         });
 

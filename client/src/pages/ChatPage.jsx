@@ -2,10 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { connectSocket, disconnectSocket, getSocket } from '../services/socket'
 import {
-    joinChannel, leaveChannel, subscribeToRemoteUser,
-    toggleMute, toggleCamera, getClient, initializeLocalTracks
-} from '../services/agora'
-import { startFrameCapture, stopFrameCapture } from '../services/frameCapture'
+    initializeLocalStream, toggleMute, toggleCamera,
+    createPeerConnection, createOffer, handleReceiveOffer,
+    handleReceiveAnswer, handleReceiveCandidate, closePeerConnection, cleanupLocalStream
+} from '../services/webrtc'
 import AuthSplitLayout from '../components/AuthSplitLayout'
 
 // ─── SVG Icons ───────────────────────────────────────────────────────────────
@@ -98,18 +98,14 @@ export default function ChatPage() {
     const token = localStorage.getItem('token')
 
     const cleanup = useCallback(async () => {
-        stopFrameCapture()
-        try {
-            await leaveChannel()
-        } catch (err) {
-            console.error('[Chat] Cleanup error:', err)
-        }
+        closePeerConnection()
     }, [])
 
     const handleDisconnect = useCallback(() => {
         const socket = getSocket()
         socket?.emit('disconnect_chat')
         cleanup()
+        cleanupLocalStream()
         setState(STATE.DISCONNECTED)
     }, [cleanup])
 
@@ -135,44 +131,29 @@ export default function ChatPage() {
 
             if (data.mode === 'video') {
                 try {
-                    const { localVideoTrack } = await joinChannel({
-                        appId: data.appId,
-                        token: data.agoraToken,
-                        channelName: data.channelName,
-                        uid: data.uid,
+                    createPeerConnection((remoteStream) => {
+                        if (remoteVideoRef.current) {
+                            remoteVideoRef.current.srcObject = remoteStream
+                        }
                     })
 
-                    if (localVideoRef.current && localVideoTrack) {
-                        localVideoTrack.play(localVideoRef.current)
+                    const stream = await initializeLocalStream()
+                    if (localVideoRef.current) {
+                        localVideoRef.current.srcObject = stream
                     }
 
-                    const client = getClient()
-                    if (client) {
-                        client.on('user-published', async (user, mediaType) => {
-                            await subscribeToRemoteUser(user, mediaType)
-                            if (mediaType === 'video' && remoteVideoRef.current) {
-                                user.videoTrack.play(remoteVideoRef.current)
-                            }
-                            if (mediaType === 'audio') {
-                                user.audioTrack.play()
-                            }
-                        })
+                    if (data.role === 'caller') {
+                        setTimeout(() => createOffer(), 500)
                     }
-
-                    startFrameCapture(
-                        localVideoRef.current?.querySelector('video') || localVideoRef.current,
-                        data.sessionId,
-                        (flagData) => {
-                            setWarning('⚠️ Content warning detected')
-                            setTimeout(() => setWarning(''), 5000)
-                            if (flagData.shouldDisconnect) handleDisconnect()
-                        }
-                    )
                 } catch (err) {
-                    console.error('[Chat] Agora join error:', err)
+                    console.error('[Chat] WebRTC join error:', err)
                 }
             }
         })
+
+        socket.on('webrtc_offer', async ({ sdp }) => await handleReceiveOffer(sdp))
+        socket.on('webrtc_answer', async ({ sdp }) => await handleReceiveAnswer(sdp))
+        socket.on('webrtc_ice_candidate', async ({ candidate }) => await handleReceiveCandidate(candidate))
 
         socket.on('receive_message', (data) => {
             setMessages((prev) => [...prev, { from: 'stranger', text: data.text, time: data.timestamp }])
@@ -182,10 +163,7 @@ export default function ChatPage() {
         socket.on('session_ended', () => { setState(STATE.DISCONNECTED); cleanup() })
         socket.on('report_submitted', () => { setState(STATE.REPORTED); cleanup() })
 
-        socket.on('moderation_warning', (data) => {
-            setWarning(`⚠️ ${data.message} (Warning ${data.warningCount}/3)`)
-            setTimeout(() => setWarning(''), 5000)
-        })
+
 
         socket.on('banned', (data) => {
             alert(data.reason)
@@ -215,7 +193,7 @@ export default function ChatPage() {
 
         if (chatMode === 'video') {
             try {
-                await initializeLocalTracks()
+                await initializeLocalStream()
             } catch {
                 setWarning('Please allow camera and microphone permissions to use Video Chat.')
                 setTimeout(() => setWarning(''), 5000)
@@ -237,6 +215,7 @@ export default function ChatPage() {
             socket?.emit('disconnect_chat')
         }
         cleanup()
+        cleanupLocalStream()
         setState(STATE.IDLE)
         setMessages([])
         setSessionId(null)
@@ -539,22 +518,23 @@ export default function ChatPage() {
                         {mode === 'video' && (
                             <div className="surface-panel relative min-h-[40vh] flex-1 overflow-hidden sm:min-h-[300px]" style={{ borderRadius: 28 }}>
                                 {/* Remote video */}
-                                <div
+                                <video
                                     ref={remoteVideoRef}
                                     id="remote-video"
-                                    className="flex h-full w-full items-center justify-center"
+                                    autoPlay
+                                    playsInline
+                                    className="h-full w-full object-cover"
                                     style={{ background: 'radial-gradient(circle at top, #1a1a2e 0%, #0d0d15 50%, #07070d 100%)' }}
-                                >
-                                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-                                        <div style={{ width: 32, height: 32, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.15)', borderTopColor: 'rgba(255,255,255,0.7)', animation: 'spin 0.8s linear infinite' }} />
-                                        <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.5)' }}>Connecting video…</span>
-                                    </div>
-                                </div>
+                                />
 
                                 {/* Local video (PiP) */}
-                                <div
+                                <video
                                     ref={localVideoRef}
                                     id="local-video"
+                                    autoPlay
+                                    playsInline
+                                    muted
+                                    className="object-cover"
                                     style={{ position: 'absolute', bottom: 14, right: 14, width: 100, aspectRatio: '3/4', borderRadius: 16, overflow: 'hidden', border: '1.5px solid rgba(255,255,255,0.18)', background: 'rgba(0,0,0,0.5)', boxShadow: '0 8px 30px rgba(0,0,0,0.4)' }}
                                 />
 
