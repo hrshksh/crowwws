@@ -1,4 +1,6 @@
-// Prisma schema for the anonymous stranger chat platform
+// Prisma schema — Crowwws anonymous stranger chat platform
+// Database: PostgreSQL (Supabase)
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,52 +10,134 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ─────────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────────
 model User {
-  id         String   @id @default(uuid())
-  email      String   @unique
-  password   String
-  isVerified Boolean  @default(false)
-  isBanned   Boolean  @default(false)
-  banReason  String?
-  createdAt  DateTime @default(now())
-  reports    Report[]
+  id          String    @id @default(uuid())
+  email       String    @unique
+  password    String
+  isVerified  Boolean   @default(false)
+  isBanned    Boolean   @default(false)
+  banReason   String?
+  warningCount Int      @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Relations
+  reportsMade     Report[]         @relation("Reporter")
+  reportsReceived Report[]         @relation("Reported")
+  moderationFlags ModerationFlag[]
+  sessionsAsUser1 Session[]        @relation("User1Sessions")
+  sessionsAsUser2 Session[]        @relation("User2Sessions")
+
+  @@index([email])
+  @@index([isBanned])
+  @@map("users")
 }
 
-model Report {
-  id         String   @id @default(uuid())
-  reporterId String
-  reportedId String
-  reason     String
-  sessionId  String
-  createdAt  DateTime @default(now())
-  reviewed   Boolean  @default(false)
-  reporter   User     @relation(fields: [reporterId], references: [id])
-}
-
-model BannedEmail {
+// ─────────────────────────────────────────────
+// ADMIN
+// ─────────────────────────────────────────────
+model Admin {
   id        String   @id @default(uuid())
   email     String   @unique
-  reason    String
+  password  String
+  role      String   @default("admin") // "admin" | "superadmin"
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+  @@map("admins")
 }
 
-model ModerationFlag {
-  id         String   @id @default(uuid())
-  sessionId  String
-  userId     String
-  type       String
-  confidence Float
-  reviewed   Boolean  @default(false)
-  action     String?
-  createdAt  DateTime @default(now())
-}
-
+// ─────────────────────────────────────────────
+// CHAT SESSION
+// ─────────────────────────────────────────────
 model Session {
   id        String    @id @default(uuid())
   user1Id   String
   user2Id   String
-  mode      String    @default("video")
+  mode      String    @default("text") // "text" | "video"
   startTime DateTime  @default(now())
   endTime   DateTime?
   flagged   Boolean   @default(false)
+  createdAt DateTime  @default(now())
+
+  // Relations
+  user1           User             @relation("User1Sessions", fields: [user1Id], references: [id], onDelete: Cascade)
+  user2           User             @relation("User2Sessions", fields: [user2Id], references: [id], onDelete: Cascade)
+  reports         Report[]
+  moderationFlags ModerationFlag[]
+
+  @@index([user1Id])
+  @@index([user2Id])
+  @@index([flagged])
+  @@index([startTime])
+  @@map("sessions")
+}
+
+// ─────────────────────────────────────────────
+// REPORT
+// ─────────────────────────────────────────────
+model Report {
+  id         String   @id @default(uuid())
+  reporterId String
+  reportedId String
+  sessionId  String
+  reason     String
+  reviewed   Boolean  @default(false)
+  outcome    String?  // "banned" | "warned" | "dismissed"
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  reporter User    @relation("Reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reported User    @relation("Reported", fields: [reportedId], references: [id], onDelete: Cascade)
+  session  Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([reporterId])
+  @@index([reportedId])
+  @@index([reviewed])
+  @@index([createdAt])
+  @@map("reports")
+}
+
+// ─────────────────────────────────────────────
+// MODERATION FLAG
+// ─────────────────────────────────────────────
+model ModerationFlag {
+  id         String   @id @default(uuid())
+  sessionId  String
+  userId     String
+  type       String   // "text" | "video"
+  confidence Float    @default(0)
+  reviewed   Boolean  @default(false)
+  action     String?  // "warned" | "banned" | "dismissed"
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([userId])
+  @@index([reviewed])
+  @@index([type])
+  @@map("moderation_flags")
+}
+
+// ─────────────────────────────────────────────
+// BANNED EMAIL
+// ─────────────────────────────────────────────
+model BannedEmail {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  reason    String
+  bannedBy  String?  // admin email who banned
+  createdAt DateTime @default(now())
+
+  @@index([email])
+  @@map("banned_emails")
 }
