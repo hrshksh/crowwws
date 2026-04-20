@@ -17,6 +17,11 @@ const transporter = nodemailer.createTransport({
  * @param {string} otp - 6-digit OTP code
  */
 async function sendOTP(email, otp) {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    console.warn('[Email] SMTP credentials not configured, skipping live email delivery.');
+    return;
+  }
+
   const mailOptions = {
     from: `"Crowwws" <${process.env.SMTP_USER}>`,
     to: email,
