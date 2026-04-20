@@ -18,8 +18,7 @@ const transporter = nodemailer.createTransport({
  */
 async function sendOTP(email, otp) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    console.warn('[Email] SMTP credentials not configured, skipping live email delivery.');
-    return;
+    throw new Error('SMTP credentials not configured, skipped live email delivery.');
   }
 
   const mailOptions = {
