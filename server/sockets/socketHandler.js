@@ -4,10 +4,7 @@ const { addToQueue, findKeywordMatch, findGeneralMatch, removeFromQueue } = requ
 const { createSession, endSession, getSession, flagSession } = require('../services/sessionManager');
 const prisma = require('../src/prisma');
 
-// Track active connections: userId -> { socketId, sessionId, partnerId, partnerSocketId }
-const activeUsers = new Map();
-// Track socketId -> userId for reverse lookup
-const socketToUser = new Map();
+const redis = require('../src/redis');
 
 /**
  * Register all Socket.io event handlers
@@ -34,12 +31,10 @@ function registerSocketHandlers(io) {
     io.on('connection', (socket) => {
         console.log(`[Socket] User connected: ${socket.userId} (${socket.id})`);
 
-        // Track connection
-        activeUsers.set(socket.userId, { socketId: socket.id, sessionId: null, partnerId: null, partnerSocketId: null });
-        socketToUser.set(socket.id, socket.userId);
-
-        // Broadcast online count
-        io.emit('online_count', activeUsers.size);
+        // Increment and broadcast online count globally
+        redis.incr('global_online_count').then((count) => {
+            io.emit('online_count', count);
+        });
 
         // ─── FIND MATCH ───
         socket.on('find_match', async ({ keywords = [], mode = 'video' }) => {
@@ -60,20 +55,18 @@ function registerSocketHandlers(io) {
                     const { matchedUser } = match;
                     const sessionData = await createSession(userId, matchedUser.userId, mode);
 
+                    // Globally cache the session routing for both users in Redis
+                    const myKey = `user:${userId}:session`;
+                    await redis.hset(myKey, 'sessionId', sessionData.sessionId);
+                    await redis.hset(myKey, 'partnerId', matchedUser.userId);
+                    await redis.hset(myKey, 'partnerSocketId', matchedUser.socketId);
+                    await redis.expire(myKey, 7200);
 
-                    // Update tracking for both users
-                    activeUsers.set(userId, {
-                        socketId: socket.id,
-                        sessionId: sessionData.sessionId,
-                        partnerId: matchedUser.userId,
-                        partnerSocketId: matchedUser.socketId,
-                    });
-                    activeUsers.set(matchedUser.userId, {
-                        socketId: matchedUser.socketId,
-                        sessionId: sessionData.sessionId,
-                        partnerId: userId,
-                        partnerSocketId: socket.id,
-                    });
+                    const partnerKey = `user:${matchedUser.userId}:session`;
+                    await redis.hset(partnerKey, 'sessionId', sessionData.sessionId);
+                    await redis.hset(partnerKey, 'partnerId', userId);
+                    await redis.hset(partnerKey, 'partnerSocketId', socket.id);
+                    await redis.expire(partnerKey, 7200);
 
                     // Remove both from queue
                     await removeFromQueue(userId);
@@ -101,13 +94,15 @@ function registerSocketHandlers(io) {
                     // Set up 10s fallback timer for keyword users
                     if (keywords.length > 0) {
                         setTimeout(async () => {
-                            const userData = activeUsers.get(userId);
-                            if (userData && !userData.sessionId) {
-                                // Still waiting — try general match
-                                const generalMatch = await findGeneralMatch(userId, mode);
-                                if (generalMatch) {
-                                    // Trigger match by re-emitting
-                                    socket.emit('find_match', { keywords: [], mode });
+                            const isStillInQueue = await redis.get(`user_queue:${userId}`);
+                            if (isStillInQueue) {
+                                // Still waiting — check if they got matched. If no session key exists:
+                                const session = await redis.hgetAll(`user:${userId}:session`);
+                                if (!session || !session.sessionId) {
+                                    const generalMatch = await findGeneralMatch(userId, mode);
+                                    if (generalMatch) {
+                                        socket.emit('find_match', { keywords: [], mode });
+                                    }
                                 }
                             }
                         }, 10000);
@@ -123,13 +118,11 @@ function registerSocketHandlers(io) {
         socket.on('send_message', async ({ text, sessionId }) => {
             try {
                 if (!text || !sessionId) return;
-
-                const userData = activeUsers.get(socket.userId);
-                if (!userData || userData.sessionId !== sessionId) return;
-
-                // Forward message directly to partner
-                if (userData.partnerSocketId) {
-                    io.to(userData.partnerSocketId).emit('receive_message', {
+                const partnerSocketId = await redis.hget(`user:${socket.userId}:session`, 'partnerSocketId');
+                
+                // Forward message natively to partner pod
+                if (partnerSocketId) {
+                    io.to(partnerSocketId).emit('receive_message', {
                         text,
                         timestamp: Date.now(),
                     });
@@ -140,59 +133,35 @@ function registerSocketHandlers(io) {
         });
 
         // ─── WEBRTC SIGNALING ───
-        socket.on('webrtc_offer', ({ sdp }) => {
-            const userData = activeUsers.get(socket.userId);
-            if (userData && userData.partnerSocketId) {
-                io.to(userData.partnerSocketId).emit('webrtc_offer', { sdp });
-            }
+        socket.on('webrtc_offer', async ({ sdp }) => {
+            const partnerSocketId = await redis.hget(`user:${socket.userId}:session`, 'partnerSocketId');
+            if (partnerSocketId) io.to(partnerSocketId).emit('webrtc_offer', { sdp });
         });
 
-        socket.on('webrtc_answer', ({ sdp }) => {
-            const userData = activeUsers.get(socket.userId);
-            if (userData && userData.partnerSocketId) {
-                io.to(userData.partnerSocketId).emit('webrtc_answer', { sdp });
-            }
+        socket.on('webrtc_answer', async ({ sdp }) => {
+            const partnerSocketId = await redis.hget(`user:${socket.userId}:session`, 'partnerSocketId');
+            if (partnerSocketId) io.to(partnerSocketId).emit('webrtc_answer', { sdp });
         });
 
-        socket.on('webrtc_ice_candidate', ({ candidate }) => {
-            const userData = activeUsers.get(socket.userId);
-            if (userData && userData.partnerSocketId) {
-                io.to(userData.partnerSocketId).emit('webrtc_ice_candidate', { candidate });
-            }
+        socket.on('webrtc_ice_candidate', async ({ candidate }) => {
+            const partnerSocketId = await redis.hget(`user:${socket.userId}:session`, 'partnerSocketId');
+            if (partnerSocketId) io.to(partnerSocketId).emit('webrtc_ice_candidate', { candidate });
         });
 
         // ─── SKIP ───
         socket.on('skip', async () => {
             try {
-                const userData = activeUsers.get(socket.userId);
-                if (!userData) return;
+                const sessionData = await redis.hgetall(`user:${socket.userId}:session`);
+                
+                if (sessionData && Object.keys(sessionData).length > 0) {
+                    await endSession(sessionData.sessionId);
 
-                if (userData.sessionId) {
-                    await endSession(userData.sessionId);
-
-                    // Notify partner
-                    if (userData.partnerSocketId) {
-                        io.to(userData.partnerSocketId).emit('partner_disconnected');
-                        // Reset partner's tracking
-                        const partnerData = activeUsers.get(userData.partnerId);
-                        if (partnerData) {
-                            activeUsers.set(userData.partnerId, {
-                                socketId: partnerData.socketId,
-                                sessionId: null,
-                                partnerId: null,
-                                partnerSocketId: null,
-                            });
-                        }
+                    if (sessionData.partnerSocketId) {
+                        io.to(sessionData.partnerSocketId).emit('partner_disconnected');
+                        await redis.del(`user:${sessionData.partnerId}:session`);
                     }
+                    await redis.del(`user:${socket.userId}:session`);
                 }
-
-                // Reset user's tracking
-                activeUsers.set(socket.userId, {
-                    socketId: socket.id,
-                    sessionId: null,
-                    partnerId: null,
-                    partnerSocketId: null,
-                });
 
                 socket.emit('session_ended');
             } catch (err) {
@@ -204,32 +173,17 @@ function registerSocketHandlers(io) {
         // ─── DISCONNECT CHAT ───
         socket.on('disconnect_chat', async () => {
             try {
-                const userData = activeUsers.get(socket.userId);
-                if (!userData) return;
+                const sessionData = await redis.hgetall(`user:${socket.userId}:session`);
+                
+                if (sessionData && Object.keys(sessionData).length > 0) {
+                    await endSession(sessionData.sessionId);
 
-                if (userData.sessionId) {
-                    await endSession(userData.sessionId);
-
-                    if (userData.partnerSocketId) {
-                        io.to(userData.partnerSocketId).emit('partner_disconnected');
-                        const partnerData = activeUsers.get(userData.partnerId);
-                        if (partnerData) {
-                            activeUsers.set(userData.partnerId, {
-                                socketId: partnerData.socketId,
-                                sessionId: null,
-                                partnerId: null,
-                                partnerSocketId: null,
-                            });
-                        }
+                    if (sessionData.partnerSocketId) {
+                        io.to(sessionData.partnerSocketId).emit('partner_disconnected');
+                        await redis.del(`user:${sessionData.partnerId}:session`);
                     }
+                    await redis.del(`user:${socket.userId}:session`);
                 }
-
-                activeUsers.set(socket.userId, {
-                    socketId: socket.id,
-                    sessionId: null,
-                    partnerId: null,
-                    partnerSocketId: null,
-                });
 
                 socket.emit('session_ended');
             } catch (err) {
@@ -240,8 +194,8 @@ function registerSocketHandlers(io) {
         // ─── REPORT USER ───
         socket.on('report_user', async ({ reason, sessionId }) => {
             try {
-                const userData = activeUsers.get(socket.userId);
-                if (!userData || !userData.partnerId) {
+                const sessionData = await redis.hgetall(`user:${socket.userId}:session`);
+                if (!sessionData || !sessionData.partnerId) {
                     return socket.emit('error', { message: 'No active session to report.' });
                 }
 
@@ -249,41 +203,27 @@ function registerSocketHandlers(io) {
                 await prisma.report.create({
                     data: {
                         reporterId: socket.userId,
-                        reportedId: userData.partnerId,
+                        reportedId: sessionData.partnerId,
                         reason: reason || 'Inappropriate behavior',
-                        sessionId: sessionId || userData.sessionId || 'unknown',
+                        sessionId: sessionId || sessionData.sessionId || 'unknown',
                     },
                 });
 
-                // Flag session
-                if (userData.sessionId) {
-                    await flagSession(userData.sessionId);
-                    await endSession(userData.sessionId);
+                // Flag and end session
+                if (sessionData.sessionId) {
+                    await flagSession(sessionData.sessionId);
+                    await endSession(sessionData.sessionId);
                 }
 
-                // End session for both users
-                if (userData.partnerSocketId) {
-                    io.to(userData.partnerSocketId).emit('session_ended', {
+                // End session natively across pods
+                if (sessionData.partnerSocketId) {
+                    io.to(sessionData.partnerSocketId).emit('session_ended', {
                         reason: 'Session ended by the other user.',
                     });
-                    const partnerData = activeUsers.get(userData.partnerId);
-                    if (partnerData) {
-                        activeUsers.set(userData.partnerId, {
-                            socketId: partnerData.socketId,
-                            sessionId: null,
-                            partnerId: null,
-                            partnerSocketId: null,
-                        });
-                    }
+                    await redis.del(`user:${sessionData.partnerId}:session`);
                 }
 
-                activeUsers.set(socket.userId, {
-                    socketId: socket.id,
-                    sessionId: null,
-                    partnerId: null,
-                    partnerSocketId: null,
-                });
-
+                await redis.del(`user:${socket.userId}:session`);
                 socket.emit('report_submitted', { message: 'Report submitted. Session ended.' });
             } catch (err) {
                 console.error('[Socket] report_user error:', err);
@@ -306,31 +246,24 @@ function registerSocketHandlers(io) {
             try {
                 console.log(`[Socket] User disconnected: ${socket.userId} (${socket.id})`);
 
-                const userData = activeUsers.get(socket.userId);
-                if (userData) {
-                    if (userData.sessionId) {
-                        await endSession(userData.sessionId);
-                        if (userData.partnerSocketId) {
-                            io.to(userData.partnerSocketId).emit('partner_disconnected');
-                            const partnerData = activeUsers.get(userData.partnerId);
-                            if (partnerData) {
-                                activeUsers.set(userData.partnerId, {
-                                    socketId: partnerData.socketId,
-                                    sessionId: null,
-                                    partnerId: null,
-                                    partnerSocketId: null,
-                                });
-                            }
+                const sessionData = await redis.hgetall(`user:${socket.userId}:session`);
+                if (sessionData && Object.keys(sessionData).length > 0) {
+                    if (sessionData.sessionId) {
+                        await endSession(sessionData.sessionId);
+                        if (sessionData.partnerSocketId) {
+                            io.to(sessionData.partnerSocketId).emit('partner_disconnected');
+                            await redis.del(`user:${sessionData.partnerId}:session`);
                         }
                     }
-                    await removeFromQueue(socket.userId);
                 }
 
-                activeUsers.delete(socket.userId);
-                socketToUser.delete(socket.id);
+                await removeFromQueue(socket.userId);
+                await redis.del(`user:${socket.userId}:session`);
 
-                // Broadcast updated online count
-                io.emit('online_count', activeUsers.size);
+                // Broadcast updated global online count
+                redis.decr('global_online_count').then((count) => {
+                    io.emit('online_count', Math.max(0, count));
+                });
             } catch (err) {
                 console.error('[Socket] disconnect cleanup error:', err);
             }
@@ -341,8 +274,9 @@ function registerSocketHandlers(io) {
 /**
  * Get count of active connected users
  */
-function getActiveUserCount() {
-    return activeUsers.size;
+async function getActiveUserCount() {
+    const count = await redis.get('global_online_count');
+    return parseInt(count || '0', 10);
 }
 
 module.exports = { registerSocketHandlers, getActiveUserCount };

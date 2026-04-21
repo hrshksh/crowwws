@@ -5,6 +5,8 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const Redis = require('ioredis');
 const redis = require('./redis');
 const prisma = require('./prisma');
 
@@ -38,6 +40,14 @@ const io = new Server(server, {
         credentials: true,
     },
 });
+
+// Attach horizontal scaling Redis adapter if REDIS_URL is provided
+if (process.env.REDIS_URL || process.env.NODE_ENV === 'production') {
+    const pubClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+    const subClient = pubClient.duplicate();
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log('[Socket] Redis Horizontal scaling adapter attached');
+}
 
 // Middleware
 app.use(cors({

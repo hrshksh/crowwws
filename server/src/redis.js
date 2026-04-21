@@ -1,6 +1,8 @@
 // Redis client with in-memory fallback when Redis is not available
 let redis;
 let connected = false;
+let pubClient = null;
+let subClient = null;
 
 function createInMemoryStore() {
   const store = new Map();
@@ -95,6 +97,8 @@ try {
     .then(() => {
       console.log('[Redis] Connected — switching from in-memory to Redis');
       redis = testClient;
+      pubClient = testClient.duplicate();
+      subClient = testClient.duplicate();
       connected = true;
     })
     .catch(() => {
@@ -110,6 +114,9 @@ try {
 // so if Redis connects later, callers automatically use the real client
 module.exports = new Proxy({}, {
   get(_, prop) {
+    if (prop === 'isRealRedis') return connected;
+    if (prop === 'pubClient') return pubClient;
+    if (prop === 'subClient') return subClient;
     return typeof redis[prop] === 'function'
       ? redis[prop].bind(redis)
       : redis[prop];
