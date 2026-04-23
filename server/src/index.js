@@ -45,6 +45,11 @@ const io = new Server(server, {
 if (process.env.REDIS_URL || process.env.NODE_ENV === 'production') {
     const pubClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
     const subClient = pubClient.duplicate();
+
+    // Prevent Node unhandled exception logs on transient disconnects
+    pubClient.on('error', () => {});
+    subClient.on('error', () => {});
+
     io.adapter(createAdapter(pubClient, subClient));
     console.log('[Socket] Redis Horizontal scaling adapter attached');
 }
