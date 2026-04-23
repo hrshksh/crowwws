@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../services/api'
 
@@ -6,7 +6,7 @@ export default function Dashboard() {
     const [stats, setStats] = useState(null)
     const [loading, setLoading] = useState(true)
 
-    const fetchStats = async () => {
+    const fetchStats = useCallback(async () => {
         try {
             const res = await api.get('/admin/stats')
             setStats(res.data)
@@ -15,13 +15,13 @@ export default function Dashboard() {
         } finally {
             setLoading(false)
         }
-    }
+    }, [])
 
     useEffect(() => {
         fetchStats()
         const interval = setInterval(fetchStats, 30000)
         return () => clearInterval(interval)
-    }, [])
+    }, [fetchStats])
 
     if (loading) return <div className="p-8 text-gray-500">Loading...</div>
 

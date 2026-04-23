@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import api from '../services/api'
 
 export default function Reports() {
@@ -6,7 +6,7 @@ export default function Reports() {
     const [filter, setFilter] = useState('false') // reviewed filter
     const [loading, setLoading] = useState(true)
 
-    const fetchReports = async () => {
+    const fetchReports = useCallback(async () => {
         setLoading(true)
         try {
             const res = await api.get(`/admin/reports?reviewed=${filter}`)
@@ -16,24 +16,28 @@ export default function Reports() {
         } finally {
             setLoading(false)
         }
-    }
+    }, [filter])
 
-    useEffect(() => { fetchReports() }, [filter])
+    useEffect(() => { fetchReports() }, [fetchReports])
 
     const handleBan = async (userId) => {
         if (!confirm('Ban this user?')) return
         try {
             await api.post('/admin/ban', { userId, reason: 'Banned from reports' })
             fetchReports()
-        } catch (err) {
+        } catch {
             alert('Failed to ban user')
         }
     }
 
     const handleDismiss = async (reportId) => {
         // Mark as reviewed by fetching again — in a real app you'd have a separate endpoint
-        alert('Report dismissed')
-        fetchReports()
+        try {
+            await api.post(`/admin/reports/${reportId}/review`, { outcome: 'dismissed' })
+            fetchReports()
+        } catch {
+            alert('Failed to dismiss report')
+        }
     }
 
     return (

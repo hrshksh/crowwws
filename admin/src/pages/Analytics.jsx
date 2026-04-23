@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import api from '../services/api'
 
 export default function Analytics() {
@@ -22,12 +22,6 @@ export default function Analytics() {
 
     if (loading) return <div className="p-8 text-gray-500">Loading...</div>
     if (!data) return <div className="p-8 text-gray-500">No data available.</div>
-
-    // Build peak hours chart data
-    const hoursData = Array.from({ length: 24 }, (_, i) => ({
-        hour: `${i}:00`,
-        sessions: 0,
-    }))
 
     return (
         <div className="p-8">

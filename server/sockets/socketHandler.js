@@ -1,7 +1,7 @@
 // Socket.io handler — matchmaking, chat, skip, disconnect, report
 const jwt = require('jsonwebtoken');
-const { addToQueue, findKeywordMatch, findGeneralMatch, removeFromQueue } = require('../services/matchmaking');
-const { createSession, endSession, getSession, flagSession } = require('../services/sessionManager');
+const { addToQueue, findKeywordMatch, findGeneralMatch, removeFromQueue, addFailedPair, normalizeKeywords } = require('../services/matchmaking');
+const { createSession, endSession, getSession, setSessionEndReason, flagSession } = require('../services/sessionManager');
 const prisma = require('../src/prisma');
 
 const redis = require('../src/redis');
@@ -31,6 +31,92 @@ function registerSocketHandlers(io) {
     io.on('connection', (socket) => {
         console.log(`[Socket] User connected: ${socket.userId} (${socket.id})`);
 
+        const setSessionRouting = async (userId, socketId, sessionData, partner, keywords) => {
+            const routingKey = `user:${userId}:session`;
+            await redis.hset(routingKey, 'sessionId', sessionData.sessionId);
+            await redis.hset(routingKey, 'attemptId', sessionData.attemptId);
+            await redis.hset(routingKey, 'partnerId', partner.userId);
+            await redis.hset(routingKey, 'partnerSocketId', partner.socketId);
+            await redis.hset(routingKey, 'mode', sessionData.mode);
+            await redis.hset(routingKey, 'keywords', JSON.stringify(normalizeKeywords(keywords)));
+            await redis.expire(routingKey, 7200);
+        };
+
+        const clearSessionRouting = async (userId, partnerId = null) => {
+            await redis.del(`user:${userId}:session`);
+            if (partnerId) {
+                await redis.del(`user:${partnerId}:session`);
+            }
+        };
+
+        const endActiveSession = async (sessionId, reason) => {
+            if (!sessionId) return null;
+            await setSessionEndReason(sessionId, reason);
+            return endSession(sessionId);
+        };
+
+        const startMatchSearch = async (keywords = [], mode = 'video', reason = 'search') => {
+            const userId = socket.userId;
+            const normalizedKeywords = normalizeKeywords(keywords);
+            console.log(`[Socket] ${userId} searching for match. Keywords: ${normalizedKeywords.join(', ')} Mode: ${mode}`);
+
+            let match = await findKeywordMatch(userId, normalizedKeywords, mode);
+
+            if (!match) {
+                match = await findGeneralMatch(userId, mode);
+            }
+
+            if (match) {
+                const { matchedUser } = match;
+                const sessionData = await createSession(userId, matchedUser.userId, mode);
+                const matchedUserQueueData = await redis.get(`user_queue:${matchedUser.userId}`);
+                const matchedKeywords = matchedUserQueueData ? JSON.parse(matchedUserQueueData).keywords || [] : matchedUser.keywords || [];
+
+                await setSessionRouting(socket.userId, socket.id, sessionData, { userId: matchedUser.userId, socketId: matchedUser.socketId }, normalizedKeywords);
+                await setSessionRouting(matchedUser.userId, matchedUser.socketId, sessionData, { userId, socketId: socket.id }, matchedKeywords);
+
+                await removeFromQueue(userId);
+                await removeFromQueue(matchedUser.userId);
+
+                socket.emit('match_found', {
+                    sessionId: sessionData.sessionId,
+                    attemptId: sessionData.attemptId,
+                    mode,
+                    role: 'caller'
+                });
+
+                io.to(matchedUser.socketId).emit('match_found', {
+                    sessionId: sessionData.sessionId,
+                    attemptId: sessionData.attemptId,
+                    mode,
+                    role: 'callee'
+                });
+
+                console.log(`[Socket] Matched: ${userId} <-> ${matchedUser.userId} (session: ${sessionData.sessionId})`);
+                return;
+            }
+
+            await addToQueue(userId, socket.id, normalizedKeywords, mode);
+            socket.emit('waiting', { message: 'Looking for a match...', reason });
+
+            if (normalizedKeywords.length > 0) {
+                setTimeout(async () => {
+                    try {
+                        const isStillInQueue = await redis.get(`user_queue:${userId}`);
+                        if (!isStillInQueue) return;
+
+                        const session = await redis.hgetall(`user:${userId}:session`);
+                        if (session && session.sessionId) return;
+
+                        await removeFromQueue(userId);
+                        await startMatchSearch([], mode, reason);
+                    } catch (err) {
+                        console.error('[Socket] keyword fallback error:', err);
+                    }
+                }, 10000);
+            }
+        };
+
         // Increment and broadcast online count globally
         redis.incr('global_online_count').then((count) => {
             io.emit('online_count', count);
@@ -39,85 +125,7 @@ function registerSocketHandlers(io) {
         // ─── FIND MATCH ───
         socket.on('find_match', async ({ keywords = [], mode = 'video' }) => {
             try {
-                const userId = socket.userId;
-                console.log(`[Socket] ${userId} searching for match. Keywords: ${keywords.join(', ')} Mode: ${mode}`);
-
-                // First try keyword match
-                let match = await findKeywordMatch(userId, keywords, mode);
-
-                if (!match) {
-                    // Try general queue
-                    match = await findGeneralMatch(userId, mode);
-                }
-
-                if (match) {
-                    // Found a match — pair them
-                    const { matchedUser } = match;
-                    const sessionData = await createSession(userId, matchedUser.userId, mode);
-
-                    // Globally cache the session routing for both users in Redis
-                    const myKey = `user:${userId}:session`;
-                    await redis.hset(myKey, 'sessionId', sessionData.sessionId);
-                    await redis.hset(myKey, 'partnerId', matchedUser.userId);
-                    await redis.hset(myKey, 'partnerSocketId', matchedUser.socketId);
-                    await redis.expire(myKey, 7200);
-
-                    const partnerKey = `user:${matchedUser.userId}:session`;
-                    await redis.hset(partnerKey, 'sessionId', sessionData.sessionId);
-                    await redis.hset(partnerKey, 'partnerId', userId);
-                    await redis.hset(partnerKey, 'partnerSocketId', socket.id);
-                    await redis.expire(partnerKey, 7200);
-
-                    // Remove both from queue
-                    await removeFromQueue(userId);
-                    await removeFromQueue(matchedUser.userId);
-
-                    // Emit match_found to both (designate local socket as caller)
-                    socket.emit('match_found', {
-                        sessionId: sessionData.sessionId,
-                        mode,
-                        role: 'caller'
-                    });
-
-                    io.to(matchedUser.socketId).emit('match_found', {
-                        sessionId: sessionData.sessionId,
-                        mode,
-                        role: 'callee'
-                    });
-
-                    console.log(`[Socket] Matched: ${userId} <-> ${matchedUser.userId} (session: ${sessionData.sessionId})`);
-                } else {
-                    // No match found — add to queue
-                    await addToQueue(userId, socket.id, keywords, mode);
-                    socket.emit('waiting', { message: 'Looking for a match...' });
-
-                    // Set up 10s fallback timer for keyword users
-                    if (keywords.length > 0) {
-                        setTimeout(async () => {
-                            const isStillInQueue = await redis.get(`user_queue:${userId}`);
-                            if (isStillInQueue) {
-                                // Still waiting — check if they got matched. If no session key exists:
-                                const session = await redis.hgetAll(`user:${userId}:session`);
-                                if (!session || !session.sessionId) {
-                                    const generalMatch = await findGeneralMatch(userId, mode);
-                                    if (generalMatch) {
-                                        socket.emit('find_match', { keywords: [], mode });
-                                    }
-                                }
-                            }
-                        }, 10000);
-                    }
-                }
-            } catch (err) {
-                console.error('[Socket] find_match error:', err);
-                socket.emit('error', { message: 'Failed to find match.' });
-            }
-        });
-
-        // ─── SEND MESSAGE ───
-        socket.on('send_message', async ({ text, sessionId }) => {
-            try {
-                if (!text || !sessionId) return;
+                await startMatchSearch(keywords, mode);
                 const partnerSocketId = await redis.hget(`user:${socket.userId}:session`, 'partnerSocketId');
                 
                 // Forward message natively to partner pod

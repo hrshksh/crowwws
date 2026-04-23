@@ -18,7 +18,7 @@ async function getStats() {
     ]);
 
     return {
-        activeUsers: getActiveUserCount(),
+        activeUsers: await getActiveUserCount(),
         activeSessions: activeSessionCount,
         reportsToday,
         flagsToday,
@@ -59,6 +59,16 @@ async function getReports(reviewed, page = 1, limit = 20) {
     );
 
     return { reports: enrichedReports, total, page, limit };
+}
+
+async function reviewReport(reportId, outcome) {
+    return prisma.report.update({
+        where: { id: reportId },
+        data: {
+            reviewed: true,
+            outcome,
+        },
+    });
 }
 
 /**
@@ -244,6 +254,7 @@ async function getAnalytics() {
 module.exports = {
     getStats,
     getReports,
+    reviewReport,
     banUser,
     unbanUser,
     getFlags,

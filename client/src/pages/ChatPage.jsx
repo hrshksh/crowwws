@@ -95,6 +95,7 @@ export default function ChatPage() {
     const localVideoRef = useRef(null)
     const remoteVideoRef = useRef(null)
     const chatEndRef = useRef(null)
+    const skipPendingRef = useRef(false)
     const token = localStorage.getItem('token')
 
     const cleanup = useCallback(async () => {
@@ -160,8 +161,19 @@ export default function ChatPage() {
             setMessages((prev) => [...prev, { from: 'stranger', text: data.text, time: data.timestamp }])
         })
 
-        socket.on('partner_disconnected', () => { setState(STATE.DISCONNECTED); cleanup() })
-        socket.on('session_ended', () => { setState(STATE.DISCONNECTED); cleanup() })
+        socket.on('partner_disconnected', () => {
+            skipPendingRef.current = false
+            setState(STATE.DISCONNECTED)
+            cleanup()
+        })
+        socket.on('session_ended', () => {
+            const shouldStaySearching = skipPendingRef.current
+            skipPendingRef.current = false
+            cleanup()
+            if (!shouldStaySearching) {
+                setState(STATE.DISCONNECTED)
+            }
+        })
         socket.on('report_submitted', () => { setState(STATE.REPORTED); cleanup() })
 
 
@@ -217,6 +229,7 @@ export default function ChatPage() {
         }
         cleanup()
         cleanupLocalStream()
+        skipPendingRef.current = false
         setState(STATE.IDLE)
         setMessages([])
         setSessionId(null)
@@ -224,15 +237,18 @@ export default function ChatPage() {
 
     const handleSkip = () => {
         const socket = getSocket()
+        skipPendingRef.current = true
         socket?.emit('skip')
         cleanup()
         setState(STATE.SEARCHING)
         setMessages([])
+        setSessionId(null)
         socket?.emit('find_match', { keywords, mode })
     }
 
     const handleReport = () => {
         const socket = getSocket()
+        skipPendingRef.current = false
         socket?.emit('report_user', { reason: 'Inappropriate behavior', sessionId })
         cleanup()
     }

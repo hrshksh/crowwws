@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import api from '../services/api'
 
 export default function Users() {
@@ -9,7 +9,7 @@ export default function Users() {
     const [loading, setLoading] = useState(true)
     const limit = 50
 
-    const fetchUsers = async () => {
+    const fetchUsers = useCallback(async () => {
         setLoading(true)
         try {
             const res = await api.get(`/admin/users?page=${page}&limit=${limit}&search=${search}`)
@@ -20,23 +20,23 @@ export default function Users() {
         } finally {
             setLoading(false)
         }
-    }
+    }, [limit, page, search])
 
-    useEffect(() => { fetchUsers() }, [page, search])
+    useEffect(() => { fetchUsers() }, [fetchUsers])
 
     const handleBan = async (userId) => {
         if (!confirm('Ban this user?')) return
         try {
             await api.post('/admin/ban', { userId, reason: 'Admin action' })
             fetchUsers()
-        } catch (err) { alert('Failed to ban') }
+        } catch { alert('Failed to ban') }
     }
 
     const handleUnban = async (userId) => {
         try {
             await api.post('/admin/unban', { userId })
             fetchUsers()
-        } catch (err) { alert('Failed to unban') }
+        } catch { alert('Failed to unban') }
     }
 
     return (

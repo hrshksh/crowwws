@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import api from '../services/api'
 
 export default function Flags() {
@@ -6,7 +6,7 @@ export default function Flags() {
     const [filter, setFilter] = useState('false')
     const [loading, setLoading] = useState(true)
 
-    const fetchFlags = async () => {
+    const fetchFlags = useCallback(async () => {
         setLoading(true)
         try {
             const res = await api.get(`/admin/flags?reviewed=${filter}`)
@@ -16,16 +16,16 @@ export default function Flags() {
         } finally {
             setLoading(false)
         }
-    }
+    }, [filter])
 
-    useEffect(() => { fetchFlags() }, [filter])
+    useEffect(() => { fetchFlags() }, [fetchFlags])
 
     const handleReview = async (flagId, action) => {
         if (action === 'ban' && !confirm('Ban this user?')) return
         try {
             await api.post(`/admin/flags/${flagId}/review`, { action })
             fetchFlags()
-        } catch (err) {
+        } catch {
             alert('Failed to review flag')
         }
     }

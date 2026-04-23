@@ -1,10 +1,42 @@
 // Matchmaking service — keyword-based queue with Redis
 const redis = require('../src/redis');
-const { v4: uuidv4 } = require('uuid');
-
 const GENERAL_QUEUE_PREFIX = 'queue:general:';
 const KEYWORD_QUEUE_PREFIX = 'queue:keywords:';
 const QUEUE_TTL = 300; // 5 min TTL on queue entries
+const FAILED_PAIR_PREFIX = 'failed_pair:';
+const FAILED_PAIR_TTL = 60;
+
+function normalizeKeywords(keywords = []) {
+    return [...new Set(
+        keywords
+            .map((keyword) => keyword?.toLowerCase().trim())
+            .filter(Boolean)
+    )];
+}
+
+function normalizeUserData(userId, socketId, keywords, mode) {
+    return {
+        userId,
+        socketId,
+        keywords: normalizeKeywords(keywords),
+        mode,
+        timestamp: Date.now(),
+    };
+}
+
+function getFailedPairKey(userIdA, userIdB) {
+    const [first, second] = [userIdA, userIdB].sort();
+    return `${FAILED_PAIR_PREFIX}${first}:${second}`;
+}
+
+async function isFailedPair(userIdA, userIdB) {
+    const failed = await redis.get(getFailedPairKey(userIdA, userIdB));
+    return !!failed;
+}
+
+async function addFailedPair(userIdA, userIdB) {
+    await redis.set(getFailedPairKey(userIdA, userIdB), '1', 'EX', FAILED_PAIR_TTL);
+}
 
 /**
  * Add a user to the matchmaking queue
@@ -14,12 +46,14 @@ const QUEUE_TTL = 300; // 5 min TTL on queue entries
  * @param {string} mode - "video" or "text"
  */
 async function addToQueue(userId, socketId, keywords, mode) {
-    const userData = JSON.stringify({ userId, socketId, keywords, mode, timestamp: Date.now() });
+    await removeFromQueue(userId);
+    const normalizedKeywords = normalizeKeywords(keywords);
+    const userData = JSON.stringify(normalizeUserData(userId, socketId, normalizedKeywords, mode));
 
     // Add to keyword-specific queues
-    if (keywords && keywords.length > 0) {
-        for (const keyword of keywords) {
-            const key = `${KEYWORD_QUEUE_PREFIX}${mode}:${keyword.toLowerCase().trim()}`;
+    if (normalizedKeywords.length > 0) {
+        for (const keyword of normalizedKeywords) {
+            const key = `${KEYWORD_QUEUE_PREFIX}${mode}:${keyword}`;
             await redis.sadd(key, userData);
             await redis.expire(key, QUEUE_TTL);
         }
@@ -42,26 +76,39 @@ async function addToQueue(userId, socketId, keywords, mode) {
  * @returns {{ matchedUser: object, matchType: string } | null}
  */
 async function findKeywordMatch(userId, keywords, mode) {
-    if (!keywords || keywords.length === 0) return null;
+    const normalizedKeywords = normalizeKeywords(keywords);
+    if (normalizedKeywords.length === 0) return null;
 
-    for (const keyword of keywords) {
-        const key = `${KEYWORD_QUEUE_PREFIX}${mode}:${keyword.toLowerCase().trim()}`;
+    for (const keyword of normalizedKeywords) {
+        const key = `${KEYWORD_QUEUE_PREFIX}${mode}:${keyword}`;
+        const skippedMembers = [];
         
-        // Try up to 3 times to pop a user (safeguard against self-matching)
-        for (let i = 0; i < 3; i++) {
+        // Try multiple candidates while preserving skipped users
+        for (let i = 0; i < 10; i++) {
             const memberJson = await redis.spop(key);
             if (!memberJson) break; // Queue empty for this keyword
 
             const member = JSON.parse(memberJson);
             if (member.userId !== userId) {
+                if (await isFailedPair(userId, member.userId)) {
+                    skippedMembers.push(memberJson);
+                    continue;
+                }
                 // Match found! Delete matched user from all queues to prevent phantom matching
                 await removeFromQueue(member.userId, memberJson);
+                if (skippedMembers.length > 0) {
+                    await redis.sadd(key, ...skippedMembers);
+                }
                 return { matchedUser: member, matchType: 'keyword' };
             } else {
                 // Was ourselves; put back and stop trying
-                await redis.sadd(key, memberJson);
+                skippedMembers.push(memberJson);
                 break;
             }
+        }
+
+        if (skippedMembers.length > 0) {
+            await redis.sadd(key, ...skippedMembers);
         }
     }
 
@@ -76,19 +123,31 @@ async function findKeywordMatch(userId, keywords, mode) {
  */
 async function findGeneralMatch(userId, mode) {
     const generalKey = `${GENERAL_QUEUE_PREFIX}${mode}`;
+    const skippedMembers = [];
 
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 10; i++) {
         const memberJson = await redis.spop(generalKey);
         if (!memberJson) break;
 
         const member = JSON.parse(memberJson);
         if (member.userId !== userId) {
+            if (await isFailedPair(userId, member.userId)) {
+                skippedMembers.push(memberJson);
+                continue;
+            }
             await removeFromQueue(member.userId, memberJson);
+            if (skippedMembers.length > 0) {
+                await redis.sadd(generalKey, ...skippedMembers);
+            }
             return { matchedUser: member, matchType: 'random' };
         } else {
-            await redis.sadd(generalKey, memberJson);
+            skippedMembers.push(memberJson);
             break;
         }
+    }
+
+    if (skippedMembers.length > 0) {
+        await redis.sadd(generalKey, ...skippedMembers);
     }
 
     return null;
@@ -107,7 +166,7 @@ async function removeFromQueue(userId, existingJson = null) {
     // Remove from keyword queues
     if (userData.keywords && userData.keywords.length > 0) {
         for (const keyword of userData.keywords) {
-            const key = `${KEYWORD_QUEUE_PREFIX}${userData.mode}:${keyword.toLowerCase().trim()}`;
+            const key = `${KEYWORD_QUEUE_PREFIX}${userData.mode}:${keyword}`;
             await redis.srem(key, userDataJson);
         }
     }
@@ -134,4 +193,6 @@ module.exports = {
     findGeneralMatch,
     removeFromQueue,
     getQueueSize,
+    addFailedPair,
+    normalizeKeywords,
 };

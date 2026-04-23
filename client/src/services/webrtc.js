@@ -1,185 +1,279 @@
-import { getSocket } from './socket';
+import { getSocket } from './socket'
 
-let peerConnection = null;
-let localStream = null;
+let peerConnection = null
+let localStream = null
+let currentAttemptId = null
+let remoteStreamSeen = false
+let connectionSettled = false
+let setupTimer = null
+let disconnectTimer = null
+let mediaFailureCallback = null
+let mediaConnectedCallback = null
+
+const SETUP_TIMEOUT_MS = 3000
+const DISCONNECT_GRACE_MS = 1500
 
 const configuration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' }, // fallback free STUN
-        {
-            urls: 'turn:openrelay.metered.ca:80',
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
+        { urls: 'stun:global.stun.twilio.com:3478' },
+    ],
+}
+
+let iceCandidateQueue = []
+
+function clearTimers() {
+    if (setupTimer) {
+        clearTimeout(setupTimer)
+        setupTimer = null
+    }
+    if (disconnectTimer) {
+        clearTimeout(disconnectTimer)
+        disconnectTimer = null
+    }
+}
+
+function failMediaConnection(reason) {
+    if (!currentAttemptId || connectionSettled) return
+    clearTimers()
+    connectionSettled = true
+    mediaFailureCallback?.(reason, currentAttemptId)
+}
+
+function markMediaConnected() {
+    if (connectionSettled || !currentAttemptId || !remoteStreamSeen) return
+    clearTimers()
+    connectionSettled = true
+    mediaConnectedCallback?.(currentAttemptId)
+}
+
+function maybeMarkConnected() {
+    if (!peerConnection || !remoteStreamSeen) return
+    if (peerConnection.connectionState === 'connected' || peerConnection.iceConnectionState === 'connected') {
+        markMediaConnected()
+    }
+}
+
+function bindConnectionObservers() {
+    if (!peerConnection) return
+
+    peerConnection.onconnectionstatechange = () => {
+        switch (peerConnection.connectionState) {
+            case 'connected':
+                maybeMarkConnected()
+                break
+            case 'failed':
+            case 'closed':
+                failMediaConnection(peerConnection.connectionState)
+                break
+            case 'disconnected':
+                if (!disconnectTimer) {
+                    disconnectTimer = setTimeout(() => failMediaConnection('disconnected'), DISCONNECT_GRACE_MS)
+                }
+                break
+            default:
+                if (disconnectTimer && peerConnection.connectionState !== 'disconnected') {
+                    clearTimeout(disconnectTimer)
+                    disconnectTimer = null
+                }
+                break
         }
-    ]
-};
+    }
 
-let iceCandidateQueue = [];
+    peerConnection.oniceconnectionstatechange = () => {
+        switch (peerConnection.iceConnectionState) {
+            case 'connected':
+            case 'completed':
+                maybeMarkConnected()
+                break
+            case 'failed':
+            case 'closed':
+                failMediaConnection(peerConnection.iceConnectionState)
+                break
+            case 'disconnected':
+                if (!disconnectTimer) {
+                    disconnectTimer = setTimeout(() => failMediaConnection('ice_disconnected'), DISCONNECT_GRACE_MS)
+                }
+                break
+            default:
+                if (disconnectTimer && peerConnection.iceConnectionState !== 'disconnected') {
+                    clearTimeout(disconnectTimer)
+                    disconnectTimer = null
+                }
+                break
+        }
+    }
+}
 
-/**
- * Initializes and returns the local video/audio stream.
- */
 export async function initializeLocalStream() {
     if (!localStream) {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     }
-    return localStream;
+    return localStream
 }
 
 export function getLocalStream() {
-    return localStream;
+    return localStream
 }
 
 export async function toggleCamera() {
     if (localStream) {
-        const videoTrack = localStream.getVideoTracks()[0];
+        const videoTrack = localStream.getVideoTracks()[0]
         if (videoTrack) {
-            videoTrack.enabled = !videoTrack.enabled;
-            return !videoTrack.enabled; // true = camera off
+            videoTrack.enabled = !videoTrack.enabled
+            return !videoTrack.enabled
         }
     }
-    return false;
+    return false
 }
 
 export async function toggleMute() {
     if (localStream) {
-        const audioTrack = localStream.getAudioTracks()[0];
+        const audioTrack = localStream.getAudioTracks()[0]
         if (audioTrack) {
-            audioTrack.enabled = !audioTrack.enabled;
-            return !audioTrack.enabled; // true = muted
+            audioTrack.enabled = !audioTrack.enabled
+            return !audioTrack.enabled
         }
     }
-    return false;
+    return false
 }
 
-/**
- * Creates the RTCPeerConnection and wires up tracks and ICE events.
- */
-export function createPeerConnection(onRemoteStream) {
+export function createPeerConnection({
+    attemptId,
+    onRemoteStream,
+    onMediaConnected,
+    onMediaFailed,
+    setupTimeoutMs = SETUP_TIMEOUT_MS,
+}) {
     if (peerConnection) {
-        peerConnection.close();
+        peerConnection.close()
     }
-    iceCandidateQueue = [];
-    peerConnection = new RTCPeerConnection(configuration);
+
+    clearTimers()
+    iceCandidateQueue = []
+    currentAttemptId = attemptId
+    remoteStreamSeen = false
+    connectionSettled = false
+    mediaFailureCallback = onMediaFailed || null
+    mediaConnectedCallback = onMediaConnected || null
+
+    peerConnection = new RTCPeerConnection(configuration)
 
     if (localStream) {
-        localStream.getTracks().forEach(track => {
-            peerConnection.addTrack(track, localStream);
-        });
+        localStream.getTracks().forEach((track) => {
+            peerConnection.addTrack(track, localStream)
+        })
     }
 
-    // Capture incoming remote stream
     peerConnection.ontrack = (event) => {
         if (event.streams && event.streams[0]) {
-            onRemoteStream(event.streams[0]);
+            remoteStreamSeen = true
+            onRemoteStream(event.streams[0])
+            maybeMarkConnected()
         }
-    };
+    }
 
-    // Propagate ICE candidates to signaling server
     peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-            const socket = getSocket();
+        if (event.candidate && currentAttemptId) {
+            const socket = getSocket()
             if (socket) {
-                socket.emit('webrtc_ice_candidate', { candidate: event.candidate });
+                socket.emit('webrtc_ice_candidate', { candidate: event.candidate, attemptId: currentAttemptId })
             }
         }
-    };
+    }
 
-    return peerConnection;
+    bindConnectionObservers()
+
+    setupTimer = setTimeout(() => {
+        if (!connectionSettled) {
+            failMediaConnection('setup_timeout')
+        }
+    }, setupTimeoutMs)
+
+    return peerConnection
 }
 
-/**
- * Caller creates offer and sends to Callee
- */
 export async function createOffer() {
-    if (!peerConnection) return;
+    if (!peerConnection || !currentAttemptId) return
     try {
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-        const socket = getSocket();
+        const offer = await peerConnection.createOffer()
+        await peerConnection.setLocalDescription(offer)
+        const socket = getSocket()
         if (socket) {
-            socket.emit('webrtc_offer', { sdp: peerConnection.localDescription });
+            socket.emit('webrtc_offer', { sdp: peerConnection.localDescription, attemptId: currentAttemptId })
         }
     } catch (err) {
-        console.error('[WebRTC] Error creating offer:', err);
+        console.error('[WebRTC] Error creating offer:', err)
+        failMediaConnection('offer_error')
     }
 }
 
-/**
- * Callee receives offer, attaches, creates answer, sends to Caller
- */
-export async function handleReceiveOffer(sdp) {
-    if (!peerConnection) return;
+export async function handleReceiveOffer({ sdp, attemptId }) {
+    if (!peerConnection || !currentAttemptId || attemptId !== currentAttemptId) return
     try {
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
-        
-        // Drain ICE queue safely now that remote desc is set
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
+
         while (iceCandidateQueue.length > 0) {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()));
+            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()))
         }
 
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
-        const socket = getSocket();
+        const answer = await peerConnection.createAnswer()
+        await peerConnection.setLocalDescription(answer)
+        const socket = getSocket()
         if (socket) {
-            socket.emit('webrtc_answer', { sdp: peerConnection.localDescription });
+            socket.emit('webrtc_answer', { sdp: peerConnection.localDescription, attemptId: currentAttemptId })
         }
     } catch (err) {
-        console.error('[WebRTC] Error handling offer:', err);
+        console.error('[WebRTC] Error handling offer:', err)
+        failMediaConnection('offer_handle_error')
     }
 }
 
-/**
- * Caller receives answer and completes connection
- */
-export async function handleReceiveAnswer(sdp) {
-    if (!peerConnection) return;
+export async function handleReceiveAnswer({ sdp, attemptId }) {
+    if (!peerConnection || !currentAttemptId || attemptId !== currentAttemptId) return
     try {
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
-        
-        // Drain ICE queue safely
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
+
         while (iceCandidateQueue.length > 0) {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()));
+            await peerConnection.addIceCandidate(new RTCIceCandidate(iceCandidateQueue.shift()))
         }
     } catch (err) {
-        console.error('[WebRTC] Error handling answer:', err);
+        console.error('[WebRTC] Error handling answer:', err)
+        failMediaConnection('answer_handle_error')
     }
 }
 
-/**
- * Both sides process ICE candidates generated by STUN
- */
-export async function handleReceiveCandidate(candidate) {
-    if (!peerConnection) return;
+export async function handleReceiveCandidate({ candidate, attemptId }) {
+    if (!peerConnection || !currentAttemptId || attemptId !== currentAttemptId) return
     if (!peerConnection.remoteDescription) {
-        // Queue candidates if remote description isn't ready
-        iceCandidateQueue.push(candidate);
-        return;
+        iceCandidateQueue.push(candidate)
+        return
     }
     try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
     } catch (err) {
-        console.error('[WebRTC] Error adding received ice candidate:', err);
+        console.error('[WebRTC] Error adding received ice candidate:', err)
     }
 }
 
-/**
- * Closes the connection for a specific match (e.g. skinning/disconnecting)
- */
 export function closePeerConnection() {
+    clearTimers()
+    mediaFailureCallback = null
+    mediaConnectedCallback = null
+    connectionSettled = false
+    remoteStreamSeen = false
+    currentAttemptId = null
+    iceCandidateQueue = []
+
     if (peerConnection) {
-        peerConnection.close();
-        peerConnection = null;
+        peerConnection.close()
+        peerConnection = null
     }
 }
 
-/**
- * Turns off the webcam/mic when exiting video chat feature
- */
 export function cleanupLocalStream() {
     if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-        localStream = null;
+        localStream.getTracks().forEach((track) => track.stop())
+        localStream = null
     }
 }

@@ -22,6 +22,10 @@ const loginSchema = z.object({
     password: z.string().min(1, 'Password is required'),
 });
 
+const resendOtpSchema = z.object({
+    email: z.string().email(),
+});
+
 /**
  * POST /api/auth/register
  * Hash password, send OTP, store in Redis with 10 min TTL
@@ -172,6 +176,42 @@ async function login(req, res) {
     }
 }
 
+async function resendOtp(req, res) {
+    try {
+        const { email } = resendOtpSchema.parse(req.body);
+
+        const pendingData = await redis.get(`pending:${email}`);
+        if (!pendingData) {
+            return res.status(400).json({ error: 'Registration expired. Please register again.' });
+        }
+
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        await redis.set(`otp:${email}`, otp, 'EX', 600);
+        await redis.expire(`pending:${email}`, 600);
+
+        let emailSent = false;
+        try {
+            await sendOTP(email, otp);
+            emailSent = true;
+        } catch (emailErr) {
+            console.error('[Auth] Failed to resend OTP email:', emailErr.message);
+            console.log(`[Auth][DEV] Resent OTP for ${email}: ${otp}`);
+        }
+
+        if (emailSent) {
+            res.json({ message: 'OTP resent to your email.' });
+        } else {
+            res.json({ message: 'OTP resent to your email.', devOtp: otp });
+        }
+    } catch (err) {
+        if (err instanceof z.ZodError) {
+            return res.status(400).json({ error: err.errors[0].message });
+        }
+        console.error('[Auth] Resend OTP error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+}
+
 /**
  * GET /api/auth/me
  * Return current user profile (protected)
@@ -194,4 +234,4 @@ async function getMe(req, res) {
     }
 }
 
-module.exports = { register, verifyOtp, login, getMe };
+module.exports = { register, verifyOtp, resendOtp, login, getMe };

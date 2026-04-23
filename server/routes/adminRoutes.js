@@ -6,6 +6,7 @@ const { verifyAdmin } = require('../middleware/authMiddleware');
 const {
     getStats,
     getReports,
+    reviewReport,
     banUser,
     unbanUser,
     getFlags,
@@ -37,6 +38,24 @@ router.get('/reports', async (req, res) => {
     } catch (err) {
         console.error('[Admin] Reports error:', err);
         res.status(500).json({ error: 'Failed to fetch reports.' });
+    }
+});
+
+const reportReviewSchema = z.object({
+    outcome: z.enum(['dismissed', 'banned', 'warned']),
+});
+
+router.post('/reports/:id/review', async (req, res) => {
+    try {
+        const { outcome } = reportReviewSchema.parse(req.body);
+        const report = await reviewReport(req.params.id, outcome);
+        res.json({ message: 'Report reviewed.', report });
+    } catch (err) {
+        if (err instanceof z.ZodError) {
+            return res.status(400).json({ error: err.errors[0].message });
+        }
+        console.error('[Admin] Review report error:', err);
+        res.status(500).json({ error: 'Failed to review report.' });
     }
 });
 

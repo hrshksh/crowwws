@@ -16,11 +16,13 @@ async function createSession(user1Id, user2Id, mode = 'video') {
     const sessionId = uuidv4();
     const sessionData = {
         sessionId,
+        attemptId: uuidv4(),
         user1Id,
         user2Id,
         mode,
         startTime: Date.now(),
         flagged: false,
+        endReason: null,
     };
 
     // Store in Redis for fast access
@@ -58,6 +60,8 @@ async function getSession(sessionId) {
  * @param {string} sessionId
  */
 async function endSession(sessionId) {
+    const sessionData = await getSession(sessionId);
+
     // Remove from Redis
     await redis.del(`session:${sessionId}`);
 
@@ -66,6 +70,17 @@ async function endSession(sessionId) {
         where: { id: sessionId },
         data: { endTime: new Date() },
     }).catch(() => { }); // Ignore if session doesn't exist in DB
+
+    return sessionData;
+}
+
+async function setSessionEndReason(sessionId, reason) {
+    const data = await getSession(sessionId);
+    if (!data) return null;
+
+    data.endReason = reason;
+    await redis.set(`session:${sessionId}`, JSON.stringify(data), 'EX', SESSION_TTL);
+    return data;
 }
 
 /**
@@ -97,6 +112,7 @@ module.exports = {
     createSession,
     getSession,
     endSession,
+    setSessionEndReason,
     flagSession,
     getActiveSessionCount,
 };
