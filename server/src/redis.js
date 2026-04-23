@@ -90,6 +90,9 @@ try {
     enableOfflineQueue: false,
   });
 
+  // Prevent missing error handler logs if Redis fails to connect
+  testClient.on('error', () => {});
+
   // Attempt connection synchronously-ish: set up memory store first, swap if Redis works
   redis = createInMemoryStore();
 
@@ -99,6 +102,12 @@ try {
       redis = testClient;
       pubClient = testClient.duplicate();
       subClient = testClient.duplicate();
+
+      // Catch error events to prevent Node.js unhandled exceptions
+      redis.on('error', (err) => console.log('[Redis] Error:', err.message));
+      pubClient.on('error', (err) => console.log('[Redis] Pub Error:', err.message));
+      subClient.on('error', (err) => console.log('[Redis] Sub Error:', err.message));
+      
       connected = true;
     })
     .catch(() => {
